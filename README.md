@@ -139,11 +139,32 @@ ends with `self-test passed` — or `FAIL: …` lines. If anything fails, the ou
 first-time failure is a wheel wanting a system library, which is one entry in `extraLibraries`
 or, better, a fix we ship).
 
+## Module changes (bump the flake input)
+
+The module rarely changes, and when it does you will hear from us. Changes so far:
+
+- **2026-09-16** — `LD_LIBRARY_PATH` now carries the nix-ld library list beside the driver path
+  (torch's `dlopen` from the Nix python never consults `NIX_LD_LIBRARY_PATH`; the first install on
+  pheonix failed its self-test on `libstdc++.so.6` for exactly this). The `extraEnvironment`
+  workaround is no longer needed. The updater unit and the `mindprint-render-node` hand tool
+  now run under the agent's sandbox (`ProtectSystem=strict`, `ProtectHome`, `ProtectKernel*`,
+  `NoNewPrivileges`, `RestrictNamespaces`, the GPU nodes the only devices, the state dir the only
+  writable path).
+
+Everything else — the agent, the model runtimes, the updater's own logic — arrives through the
+updater and needs nothing from you. The updater refuses an advert whose URL is not this node's
+own server under the release route, follows no redirects, and refuses a version or file name
+that is not a plain name. A release it refused (a failed self-test, say, because of a host
+problem since fixed) is tried again after six hours, up to six times; `mindprint-render-node
+retry-update` forgets the refusals so the next run (within five minutes) tries at once — no root.
+
 ## Day to day
 
 - **Using the card yourself:** nothing to do. The agent finishes the render it holds and stops
-  claiming while any other process holds more than ~1 GB of the card's memory (a compositor is
-  well under that; a game or a training run is not). It runs at `Nice=10`. When the memory is
+  claiming while the **total** memory held by processes other than its own exceeds the threshold
+  (4 GB by default — a compositor or a browser's GPU process is under that; a game, a training
+  run, or a resident Whisper daemon plus a browser may not be). The threshold is a Mindprint-side setting we can raise; tell us if
+  something legitimate on the machine sits above it. It runs at `Nice=10`. When the memory is
   released it resumes.
 - **Stop it:** `systemctl stop mindprint-render-node` — the card is free within one render
   (seconds for most models, under a minute for Z-Image). `start` brings it back.
@@ -156,10 +177,15 @@ or, better, a fix we ship).
 - **Remove it:** `services.mindprint-render.enable = false;`, rebuild, `rm -rf
   /var/lib/mindprint-render`. The credential can be revoked from our side at any time.
 
-## Z-Image on a 24 GB card
+## Which machine holds which model
 
-The two Z-Image models are ~20.5 GB of bf16 weights, which does not reliably fit beside a
-desktop compositor on a 24 GB card. On such a card the node starts them with per-component
-CPU offload (each stage moves to the card for its turn); it costs a few seconds per image over
-PCIe and needs ~24 GB of free system RAM while a Z-Image lane is loaded. FLUX.2-klein (~16 GB)
-runs fully on the card. Nothing to configure; it is decided from the card's reported memory.
+Decided from our side, per machine, from the card and the host it reports:
+
+- **SDXL** (~7 GB) and **SD 1.5** fit any of the cards resident.
+- **FLUX.2-klein** (~16 GB) runs resident on a 24 GB card.
+- **Z-Image** (Turbo or Base, ~20.5 GB of bf16 weights) does not reliably fit beside a desktop
+  compositor on a 24 GB card, so there the node starts it with per-component CPU offload — each
+  stage moves to the card for its turn, a few seconds per image over PCIe — which keeps the
+  weights in system RAM and needs **~24 GB of free RAM**. A host with less (pheonix: 32 GB
+  installed, ~23 GB idle) refuses the lane with a sentence on our page rather than swapping the
+  desktop; it is a lane for the boxes with more RAM. Nothing to configure on the machine.

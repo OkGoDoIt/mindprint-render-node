@@ -29,12 +29,14 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HOME = pathlib.Path(os.environ.get("MINDPRINT_RENDER_HOME", "/var/lib/mindprint-render"))
@@ -51,6 +53,29 @@ HEALTH_TIMEOUT = float(os.environ.get("MINDPRINT_RENDER_HEALTH_TIMEOUT", "300"))
 KEEP_RELEASES = 3
 BAD = STATE / "bad-versions.json"
 DELEGATE_TIMEOUT = float(os.environ.get("MINDPRINT_RENDER_DELEGATE_TIMEOUT", "7000"))
+# A refused version is tried again after this long, a bounded number of times: the host may have
+# been fixed since (a missing library, a full disk), and nobody should need root to say so.
+RETRY_BAD_AFTER = float(os.environ.get("MINDPRINT_RENDER_RETRY_BAD_AFTER", str(6 * 3600)))
+MAX_BAD_TRIES = int(os.environ.get("MINDPRINT_RENDER_MAX_BAD_TRIES", "6"))
+# What a release version or file name may look like: no separators, no dots-only, nothing a path
+# could be built from. The server names them; the node still checks.
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RELEASE_PATH = "/internal/render-nodes/release/"
+
+
+class AdvertRefused(RuntimeError):
+    """The advert itself is unacceptable (off-server URL, a version that is a path): the node's
+    fault to report, not the release's — so it is not remembered as a bad version."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """The bearer token goes to exactly the server configured, never to wherever a 3xx points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl!r} refused", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects())
 
 
 def log(message: str) -> None:
@@ -67,9 +92,31 @@ def token() -> str | None:
     return value or None
 
 
+def release_url(advert: dict) -> str:
+    """The advertised download, if and only if it is on our own server under the release route.
+
+    The advert is authenticated (it came back over the bearer-token call), but it is still input:
+    an absolute URL must have the configured server's scheme and host, and any form must sit under
+    the release route. Anything else is refused before the token is attached.
+    """
+    url = advert.get("url")
+    if not isinstance(url, str) or not url:
+        raise AdvertRefused("advert has no download url")
+    ours = urllib.parse.urlsplit(SERVER)
+    if url.startswith("/"):
+        target = urllib.parse.urlsplit(url)
+        if target.netloc or not target.path.startswith(RELEASE_PATH):
+            raise AdvertRefused(f"advert url {url!r} is not under the release route")
+        return SERVER + url
+    target = urllib.parse.urlsplit(url)
+    if (target.scheme, target.netloc) != (ours.scheme, ours.netloc) or not target.path.startswith(RELEASE_PATH):
+        raise AdvertRefused(f"advert url {url!r} is not this node's server ({SERVER}) under the release route")
+    return url
+
+
 def request(path: str, tok: str, stream_to=None, timeout: float = 60.0):
     # A bare route ("/release") is relative to the node API; the advert's download URL arrives
-    # as a server-absolute path ("/internal/render-nodes/release/…").
+    # as a server-absolute path ("/internal/render-nodes/release/…") and is checked by release_url.
     url = path if path.startswith("http") else (SERVER + path if path.startswith("/internal/") else BASE + path)
     req = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + tok,
@@ -77,7 +124,7 @@ def request(path: str, tok: str, stream_to=None, timeout: float = 60.0):
         "User-Agent": "mindprint-render-node/updater",
         "Accept": "application/json",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 - our own server
+    with _OPENER.open(req, timeout=timeout) as response:  # noqa: S310 - our own server, redirects refused
         if stream_to is None:
             raw = response.read()
             return response.status, (json.loads(raw) if raw else None)
@@ -111,9 +158,25 @@ def bad_versions() -> dict:
 
 def mark_bad(version: str, why: str) -> None:
     bad = bad_versions()
-    bad[version] = {"why": why[:500], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    tries = int((bad.get(version) or {}).get("tries") or 0) + 1
+    bad[version] = {"why": why[:500], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "epoch": time.time(), "tries": tries}
     STATE.mkdir(parents=True, exist_ok=True)
     BAD.write_text(json.dumps(bad, indent=1), encoding="utf-8")
+
+
+def still_refused(version: str) -> str | None:
+    """Why a refused version stays refused right now, or None when it is due another try."""
+    entry = bad_versions().get(version)
+    if not entry:
+        return None
+    tries = int(entry.get("tries") or 1)
+    if tries >= MAX_BAD_TRIES:
+        return f"refused {tries} times ({entry.get('why', '')[:80]}); waiting for a newer release"
+    age = time.time() - float(entry.get("epoch") or 0)
+    if age < RETRY_BAD_AFTER:
+        return f"refused {age / 3600:.1f} h ago ({entry.get('why', '')[:80]}); trying again after {RETRY_BAD_AFTER / 3600:.0f} h"
+    return None
 
 
 def agent_status() -> dict | None:
@@ -159,7 +222,17 @@ def ask_restart() -> None:
 # ── the steps ──────────────────────────────────────────────────────────────────────────────
 
 def fetch(advert: dict, tok: str) -> pathlib.Path:
-    version, file, expected, size = advert["version"], advert["file"] if "file" in advert else advert["url"].rsplit("/", 1)[-1], advert["sha256"].lower(), int(advert.get("size") or 0)
+    version = advert.get("version")
+    file = advert["file"] if "file" in advert else str(advert.get("url", "")).rsplit("/", 1)[-1]
+    if not isinstance(version, str) or not SAFE_NAME.match(version):
+        raise AdvertRefused(f"advertised version {version!r} is not a plain name")
+    if not isinstance(file, str) or not SAFE_NAME.match(file):
+        raise AdvertRefused(f"advertised file {file!r} is not a plain name")
+    expected = str(advert.get("sha256") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise AdvertRefused("advert carries no usable sha256")
+    size = int(advert.get("size") or 0)
+    url = release_url(advert)
     target = RELEASES / version
     if (target / ".ready").is_file():
         return target
@@ -171,7 +244,7 @@ def fetch(advert: dict, tok: str) -> pathlib.Path:
     tarball = part / file
     log(f"downloading {version} ({size:,} bytes)")
     with tarball.open("wb") as handle:
-        _status, (digest, total) = request(advert["url"], tok, stream_to=handle, timeout=600.0)
+        _status, (digest, total) = request(url, tok, stream_to=handle, timeout=600.0)
     if digest != expected:
         shutil.rmtree(part, ignore_errors=True)
         raise RuntimeError(f"checksum mismatch for {version}: got {digest[:12]}, expected {expected[:12]}")
@@ -348,19 +421,25 @@ def main() -> int:
         return check_crash_loop(None) or 0
 
     version = advert.get("version")
-    if not version:
+    if not version or not isinstance(version, str):
         log("advertised release has no version")
         return 1
     if version == current_version():
         prune()
         return check_crash_loop(version) or 0
-    if version in bad_versions():
-        log(f"{version} was refused earlier ({bad_versions()[version]['why'][:80]}); waiting for a newer one")
+    refused = still_refused(version)
+    if refused:
+        log(f"{version}: {refused}")
         return 0
+    if version in bad_versions():
+        log(f"{version} was refused earlier; trying it again (the host may have been fixed since)")
 
     try:
         release = fetch(advert, tok)
         prepare_and_test(release)
+    except AdvertRefused as error:
+        log(f"refusing the advert itself: {error}")
+        return 1
     except Exception as error:  # noqa: BLE001
         log(f"refusing {version}: {error}")
         mark_bad(version, str(error))

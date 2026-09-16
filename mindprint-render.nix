@@ -39,8 +39,11 @@ let
     MINDPRINT_RENDER_SERVER = cfg.server;
     MINDPRINT_RENDER_GPU = toString cfg.gpuIndex;
     MINDPRINT_RENDER_TOKEN_FILE = cfg.tokenFile;
-    # libcuda.so.1 and friends live here on NixOS; the wheels find them through this and nix-ld.
-    LD_LIBRARY_PATH = driverLibs;
+    # torch dlopen()s its shared objects from the Nix python3, which never goes through nix-ld, so
+    # NIX_LD_LIBRARY_PATH is never consulted for them — only LD_LIBRARY_PATH is (Allan, 2026-09-16:
+    # "libstdc++.so.6: cannot open shared object file" on every runtime with the driver path alone).
+    # Both carry the same list; the driver's libcuda lives under /run/opengl-driver on NixOS.
+    LD_LIBRARY_PATH = "${lib.makeLibraryPath runtimeLibs}:${driverLibs}";
     NIX_LD_LIBRARY_PATH = "${lib.makeLibraryPath runtimeLibs}:${driverLibs}";
     NIX_LD = "${pkgs.stdenv.cc.bintools.dynamicLinker}";
     PYTHONUNBUFFERED = "1";
@@ -50,6 +53,35 @@ let
   path = [ python pkgs.uv pkgs.coreutils pkgs.bash pkgs.gnutar pkgs.gzip pkgs.procps pkgs.systemd ]
     ++ nvidiaBin ++ cfg.extraPackages;
   updater = pkgs.writeText "mindprint-render-updater.py" (builtins.readFile ./updater.py);
+  # The GPU device nodes are the only devices either unit may touch; the self-test the updater runs
+  # needs them as much as the agent does.
+  deviceAllow = [ "/dev/nvidia0 rw" "/dev/nvidia1 rw" "/dev/nvidia2 rw" "/dev/nvidia3 rw" "/dev/nvidiactl rw" "/dev/nvidia-uvm rw" "/dev/nvidia-uvm-tools rw" "/dev/nvidia-modeset rw" "/dev/dri rw" "char-nvidia-caps rw" ];
+  # Hardening shared by the agent, the updater and the hand tool: the state tree is the only
+  # writable place, no new privileges, no home directories, no kernel knobs.
+  sandbox = {
+    NoNewPrivileges = true;
+    PrivateTmp = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    RestrictSUIDSGID = true;
+    RestrictRealtime = true;
+    RestrictNamespaces = true;
+    LockPersonality = true;
+    SystemCallArchitectures = "native";
+    ReadWritePaths = [ home ];
+    DeviceAllow = deviceAllow;
+  };
+  sandboxArgs = lib.concatStringsSep " " (
+    lib.mapAttrsToList (k: v:
+      if builtins.isList v then lib.concatMapStringsSep " " (x: "--property=${k}=\"${x}\"") v
+      else "--property=${k}=${if builtins.isBool v then (if v then "true" else "false") else toString v}")
+      sandbox);
 in
 {
   options.services.mindprint-render = {
@@ -159,6 +191,7 @@ in
         fi
         exec ${pkgs.systemd}/bin/systemd-run --quiet --pipe --wait --collect \
           --uid=mindprint-render --gid=mindprint-render \
+          --property=WorkingDirectory=${home} ${sandboxArgs} \
           ${lib.concatStringsSep " " (lib.mapAttrsToList (k: v: "--setenv=${k}=${v}") environment)} \
           --setenv=PATH=${lib.makeBinPath path} \
           ${home}/current/bin/mindprint-render-node "$@"
@@ -186,23 +219,11 @@ in
         KillSignal = "SIGTERM";
         TimeoutStopSec = 600;
         KillMode = "mixed";
-        # Hardening in the shape the Mindprint server units use. The state tree is the only
-        # writable place; the GPU device nodes are the only devices.
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectControlGroups = true;
-        RestrictSUIDSGID = true;
-        ReadWritePaths = [ home ];
-        DeviceAllow = [ "/dev/nvidia0 rw" "/dev/nvidia1 rw" "/dev/nvidia2 rw" "/dev/nvidia3 rw" "/dev/nvidiactl rw" "/dev/nvidia-uvm rw" "/dev/nvidia-uvm-tools rw" "/dev/nvidia-modeset rw" "/dev/dri rw" "char-nvidia-caps rw" ];
         # A desktop's owner comes first: the agent and the model run at low priority.
         Nice = 10;
         IOSchedulingClass = "best-effort";
         IOSchedulingPriority = 6;
-      };
+      } // sandbox;
       unitConfig.StartLimitIntervalSec = 0;
     };
 
@@ -217,14 +238,9 @@ in
         Group = "mindprint-render";
         WorkingDirectory = home;
         ExecStart = "${python}/bin/python3 ${updater}";
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        ReadWritePaths = [ home ];
         # Building a runtime environment and self-testing it can take a while on first install.
         TimeoutStartSec = "2h";
-      };
+      } // sandbox;
     };
 
     systemd.timers.mindprint-render-updater = {
