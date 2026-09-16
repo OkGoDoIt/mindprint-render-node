@@ -134,10 +134,12 @@ mindprint-render-node selftest                              # imports, torch see
 ```
 
 The self-test prints one line per runtime with the torch/CUDA versions and the card name, and
-ends with `self-test passed` — or `FAIL: …` lines. If anything fails, the output of the two
-`journalctl` commands and of `selftest` is all we need to fix it from our side (the most likely
-first-time failure is a wheel wanting a system library, which is one entry in `extraLibraries`
-or, better, a fix we ship).
+ends with `self-test passed` — or `FAIL: …` lines. **You should not need to forward any of it:**
+the agent carries its recent lines and the model process's stderr in every heartbeat, and the
+updater posts its own lines whenever it refuses a release, rolls back or switches, so a
+traceback or a refusal shows up on our Render nodes page under the machine's *Log* within a
+minute. The journal is only for the one case where nothing reaches us at all — no credential,
+no network, or the very first install failing before anything has run.
 
 ## Module changes (bump the flake input)
 

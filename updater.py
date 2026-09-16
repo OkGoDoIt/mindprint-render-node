@@ -78,8 +78,31 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirects())
 
 
+LINES: list = []
+
+
 def log(message: str) -> None:
     print(f"[updater] {message}", flush=True)
+    LINES.append(f"{time.strftime('%H:%M:%S')} {message}"[:400])
+
+
+def report(tok: str | None, why: str) -> None:
+    """Post this run's lines to the server so a refusal or a rollback is read on the page, not in
+    a journal the machine's owner has to forward. Best effort: a failure here is only printed."""
+    if not tok or not LINES:
+        return
+    payload = json.dumps({"source": "updater", "lines": LINES[-200:] + [f"{time.strftime('%H:%M:%S')} ({why})"]}).encode("utf-8")
+    req = urllib.request.Request(BASE + "/log", data=payload, method="POST", headers={
+        "Authorization": "Bearer " + tok,
+        "X-Mindprint-Render-Protocol": "1",
+        "Content-Type": "application/json",
+        "User-Agent": "mindprint-render-node/updater",
+    })
+    try:
+        with _OPENER.open(req, timeout=20) as response:  # noqa: S310 - our own server
+            response.read()
+    except Exception as error:  # noqa: BLE001
+        print(f"[updater] could not post the log to the server: {error}", flush=True)
 
 
 # ── the server ─────────────────────────────────────────────────────────────────────────────
@@ -400,6 +423,16 @@ def main() -> int:
     delegated = delegate()
     if delegated is not None:
         return delegated
+    switched = {"yes": False}
+    rc = _main(switched)
+    if rc != 0:
+        report(token(), f"exit {rc}")
+    elif switched["yes"]:
+        report(token(), "switched")
+    return rc
+
+
+def _main(switched: dict) -> int:
     tok = token()
     if not tok:
         log(f"no credential at {TOKEN_FILE}; nothing to do")
@@ -452,6 +485,7 @@ def main() -> int:
     (STATE / "drain-requested").unlink(missing_ok=True)
     ask_restart()
     log(f"switched current → {version}; agent asked to restart")
+    switched["yes"] = True
 
     if not was_running:
         log("agent was not running; the new release starts with the service")
