@@ -1,0 +1,139 @@
+# Mindprint render node — setup notes for the machine's owner
+
+This is the NixOS module for running a Mindprint render node on a desktop with an NVIDIA card.
+The node asks Mindprint for image-generation work over outbound HTTPS, renders it on the card,
+uploads the image, and asks again. Mindprint never connects in; the machine never listens.
+
+Everything below is what the module does, what it needs from you, and how to check it. It is
+written so that the three machines can carry an identical configuration and any of them can be
+switched on by setting one option.
+
+## What it does on the machine
+
+- Creates a system user `mindprint-render` (no login, no sudo, no home outside its state dir).
+- Creates `/var/lib/mindprint-render/{state,releases,models,cache,venvs}` (see *Disk* below).
+- Installs two systemd units: `mindprint-render-node.service` (the agent, `Restart=always`,
+  hardened: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `PrivateTmp`, the state
+  dir the only writable path, the NVIDIA device nodes the only devices, `Nice=10`) and
+  `mindprint-render-updater.timer` (a oneshot every five minutes that pulls the release
+  Mindprint advertises, verifies its SHA-256, builds the Python environments, self-tests, and
+  flips a `current` symlink — with automatic rollback if the new one does not come up).
+- Enables `programs.nix-ld` and adds four libraries to its list (`stdenv.cc.cc.lib`, `zlib`,
+  `glib`, `libGL`). The model runtimes are the same pip wheels the production predictors pin
+  (PyTorch's CUDA builds), which are manylinux binaries; nix-ld is how they run on NixOS. If you
+  already manage nix-ld, the lists merge. This is the module's only system-wide effect.
+- Puts one command on the PATH: `mindprint-render-node` (`status`, `pause`, `resume`,
+  `selftest`).
+
+It does **not** open a port, change the firewall, touch Tailscale or any network setting, add a
+sudo rule, install Docker, or run anything as root after the rebuild. Its only listening socket
+is a Unix socket inside its own state directory. Outbound connections go to
+`beta.mindprint.ai:443`, and — for downloads only — `huggingface.co` (+ its CDN hosts) for model
+weights and `pypi.org` / `files.pythonhosted.org` / `download.pytorch.org` for wheels.
+
+## What it needs
+
+- NixOS with the NVIDIA driver working (`nvidia-smi` shows the card). The module reads
+  `hardware.nvidia.package` for `nvidia-smi` and uses `/run/opengl-driver/lib` for `libcuda`;
+  it changes neither.
+- Python 3.11 from nixpkgs (`pkgs.python311`, overridable) and `uv`, both pulled by the module.
+- **Disk** under `/var/lib/mindprint-render`: the two Python environments are about 12 GB
+  together; weights are downloaded once per model and kept — FLUX.2-klein ≈ 16 GB, Z-Image
+  (Turbo or Base) ≈ 20 GB each, SDXL ≈ 7 GB, SD 1.5 ≈ 3 GB. Budget 30 GB for one Z-Image lane,
+  100 GB if every lane ends up on the machine. If `/var/lib` is small, set `stateDir` to a path
+  on the big disk.
+- One credential per machine, from Roger (a line like `mprn_rn-xxxxxxxxxxxx_<64 hex>`). It
+  authorizes only the render-node API at Mindprint and can be revoked from our side at any
+  time. Do not reuse one credential on two machines: to us that looks like one node flapping
+  between two cards, and both will keep interrupting each other.
+
+## Install
+
+Add the flake input and the module, then enable it on the hosts you choose:
+
+```nix
+{
+  inputs.mindprint-render.url = "github:OkGoDoIt/mindprint-render-node";
+  # No inputs of its own — it takes pkgs from your system, so no nixpkgs pin and no lock churn.
+
+  # In the host's configuration:
+  imports = [ inputs.mindprint-render.nixosModules.default ];
+
+  services.mindprint-render = {
+    enable = true;
+    tokenFile = "/run/secrets/mindprint-render-token";   # or wherever your secrets land
+    gpuIndex = 0;                                         # which CUDA device this node owns
+  };
+}
+```
+
+Options with their defaults, all optional:
+
+| option | default | what it is |
+|---|---|---|
+| `server` | `https://beta.mindprint.ai` | the Mindprint host it talks to |
+| `gpuIndex` | `0` | the CUDA device; one node = one card |
+| `tokenFile` | `<stateDir>/state/token` | the credential, one line, readable by `mindprint-render` (0600 owned by it, or 0640 in its group); a sops-nix / agenix path works |
+| `stateDir` | `/var/lib/mindprint-render` | releases, weights, environments, state |
+| `updateEvery` | `5min` | the updater's cadence |
+| `python` | `pkgs.python311` | interpreter for the agent and the environments |
+| `extraLibraries` | `[]` | more libraries for nix-ld, if a wheel wants one we did not list |
+| `extraPackages` | `[]` | more on the services' PATH |
+| `extraEnvironment` | `{}` | e.g. `HTTPS_PROXY` |
+
+If you would rather not depend on a GitHub flake input, the module is two files
+(`mindprint-render.nix`, `updater.py`); vendoring them works the same, and they change rarely —
+the worker itself and everything that runs the models arrive through the updater, not through
+this module.
+
+## The credential
+
+Without a token file the services start, log "no credential", and do nothing. With one, the
+next updater run (at most five minutes; `systemctl start mindprint-render-updater.service`
+runs it now) downloads the release, builds the two Python environments (5–15 minutes the first
+time, ~6 GB of wheels), self-tests, and starts the agent. The agent then shows up on our side.
+
+Which model a card holds is chosen from Mindprint, not on the machine: once the node appears,
+Roger assigns it a model and the node downloads those weights (once) and loads them. Any of the
+three machines can hold any model; nothing per-model is configured here.
+
+## Check that it works
+
+```bash
+systemctl status mindprint-render-updater.timer mindprint-render-node.service
+journalctl -u mindprint-render-updater -n 100 --no-pager    # download, environments, self-test
+journalctl -u mindprint-render-node -n 50 --no-pager        # heartbeats, model load, renders
+mindprint-render-node status                                # what it holds, what it is doing
+mindprint-render-node selftest                              # imports, torch sees the card, weights
+```
+
+The self-test prints one line per runtime with the torch/CUDA versions and the card name, and
+ends with `self-test passed` — or `FAIL: …` lines. If anything fails, the output of the two
+`journalctl` commands and of `selftest` is all we need to fix it from our side (the most likely
+first-time failure is a wheel wanting a system library, which is one entry in `extraLibraries`
+or, better, a fix we ship).
+
+## Day to day
+
+- **Using the card yourself:** nothing to do. The agent finishes the render it holds and stops
+  claiming while any other process holds more than ~1 GB of the card's memory (a compositor is
+  well under that; a game or a training run is not). It runs at `Nice=10`. When the memory is
+  released it resumes.
+- **Stop it:** `systemctl stop mindprint-render-node` — the card is free within one render
+  (seconds for most models, under a minute for Z-Image). `start` brings it back.
+- **Pause across reboots:** `mindprint-render-node pause` / `resume`.
+- **Suspend / sleep:** fine. A render interrupted by sleep is re-done elsewhere; the node
+  reconnects on wake.
+- **Updates:** automatic, from Mindprint, verified by checksum, with a self-test before and a
+  health check after (and a rollback if the health check fails). Nothing is fetched from GitHub
+  after the rebuild. We will tell you if this module itself ever needs a newer commit.
+- **Remove it:** `services.mindprint-render.enable = false;`, rebuild, `rm -rf
+  /var/lib/mindprint-render`. The credential can be revoked from our side at any time.
+
+## Z-Image on a 24 GB card
+
+The two Z-Image models are ~20.5 GB of bf16 weights, which does not reliably fit beside a
+desktop compositor on a 24 GB card. On such a card the node starts them with per-component
+CPU offload (each stage moves to the card for its turn); it costs a few seconds per image over
+PCIe and needs ~24 GB of free system RAM while a Z-Image lane is loaded. FLUX.2-klein (~16 GB)
+runs fully on the card. Nothing to configure; it is decided from the card's reported memory.
