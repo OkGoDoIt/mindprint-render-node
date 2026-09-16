@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The render node's pull updater (D294). Installed by the NixOS module as the bootstrap copy and
+"""The render node's pull updater (D300). Installed by the NixOS module as the bootstrap copy and
 run every few minutes by a systemd timer as the service user. Standard library only.
 
 Every release also ships this file (nixos/updater.py): once one is live, the bootstrap copy hands

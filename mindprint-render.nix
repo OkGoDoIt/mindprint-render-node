@@ -1,4 +1,4 @@
-# The Mindprint render node as a NixOS module (D294).
+# The Mindprint render node as a NixOS module (D300).
 #
 # Import it and set the options; nothing else on the box changes. It creates a service user, a
 # state tree under /var/lib/mindprint-render, the agent service, the updater timer, and the nix-ld
