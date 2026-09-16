@@ -8,27 +8,6 @@ Everything below is what the module does, what it needs from you, and how to che
 written so that the three machines can carry an identical configuration and any of them can be
 switched on by setting one option.
 
-## Quick start (per machine)
-
-1. **Mint the machine's credential.** Signed in to Mindprint as an operator, open
-   https://beta.mindprint.ai/admin/render-nodes/enroll, enter the machine's name (its hostname
-   is fine) and press the button. The page shows the credential once, with a **Copy** button
-   and a **Download** button that saves it as a one-line `mindprint-render-token` file, plus
-   the same steps as below with the values filled in. One credential per machine.
-2. **Add the module** to the machine's flake and enable it (the snippet under *Install*):
-   the flake input, `imports = [ inputs.mindprint-render.nixosModules.default ]`, and
-   `services.mindprint-render = { enable = true; tokenFile = "…"; gpuIndex = 0; }`.
-3. **Place the credential** where `tokenFile` points, readable by the `mindprint-render` user
-   — a sops-nix / agenix secret owned by it, or after the rebuild:
-   `sudo install -m 0600 -o mindprint-render -g mindprint-render /dev/stdin /var/lib/mindprint-render/state/token <<< 'mprn_…'`
-   with `tokenFile` left at its default.
-4. **Rebuild.** Within five minutes the updater downloads the worker, builds its Python
-   environments (5–15 minutes the first time) and self-tests; the machine then appears on
-   Mindprint's Render nodes page, where the model it holds is chosen. To check on the
-   machine: `mindprint-render-node status` and `mindprint-render-node selftest`.
-
-The rest of this file is the detail behind those four steps.
-
 ## What it does on the machine
 
 - Creates a system user `mindprint-render` (no login, no sudo, no home outside its state dir).
@@ -63,13 +42,10 @@ weights and `pypi.org` / `files.pythonhosted.org` / `download.pytorch.org` for w
   (Turbo or Base) ≈ 20 GB each, SDXL ≈ 7 GB, SD 1.5 ≈ 3 GB. Budget 30 GB for one Z-Image lane,
   100 GB if every lane ends up on the machine. If `/var/lib` is small, set `stateDir` to a path
   on the big disk.
-- One credential per machine (a line like `mprn_rn-xxxxxxxxxxxx_<64 hex>`). You mint it
-  yourself: signed in to Mindprint as an operator, open
-  https://beta.mindprint.ai/admin/render-nodes/enroll, name the machine, and the page shows
-  the credential once, with a download button for the token file and the exact install
-  command. It authorizes only the render-node API at Mindprint and can be revoked from our
-  side at any time. Do not reuse one credential on two machines: to us that looks like one node
-  flapping between two cards, and both will keep interrupting each other.
+- One credential per machine, from Roger (a line like `mprn_rn-xxxxxxxxxxxx_<64 hex>`). It
+  authorizes only the render-node API at Mindprint and can be revoked from our side at any
+  time. Do not reuse one credential on two machines: to us that looks like one node flapping
+  between two cards, and both will keep interrupting each other.
 
 ## Install
 
@@ -112,9 +88,7 @@ this module.
 
 ## The credential
 
-Mint one per machine at https://beta.mindprint.ai/admin/render-nodes/enroll (you need to be
-signed in as an operator). Without a token file the services start, log "no credential", and
-do nothing. With one, the
+Without a token file the services start, log "no credential", and do nothing. With one, the
 next updater run (at most five minutes; `systemctl start mindprint-render-updater.service`
 runs it now) downloads the release, builds the two Python environments (5–15 minutes the first
 time, ~6 GB of wheels), self-tests, and starts the agent. The agent then shows up on our side.
