@@ -21,7 +21,9 @@
 #
 # What the owner keeps: `systemctl stop mindprint-render-node` (the card is free within one
 # render), `mindprint-render-node pause` / `resume` (a pause that survives reboots), and the whole
-# thing goes away with `services.mindprint-render.enable = false`.
+# thing goes away with `services.mindprint-render.enable = false`. `keepRenders` (D319) keeps a
+# copy of every image the node renders, with its generation written into the PNG, for the owner
+# to browse; Mindprint's page shows whether it is on and prints the snippet that changes it.
 { config, lib, pkgs, ... }:
 
 let
@@ -48,7 +50,15 @@ let
     NIX_LD = "${pkgs.stdenv.cc.bintools.dynamicLinker}";
     PYTHONUNBUFFERED = "1";
     HOME = home;
+    # The owner's local copy of every render (D319): declared here, reported by the agent on every
+    # heartbeat, never switched from Mindprint's side. Absent variable = a module before the option.
+    MINDPRINT_RENDER_KEEP_RENDERS = if keep.enable then "1" else "0";
+    MINDPRINT_RENDER_RENDERS_DIR = keep.directory;
+    MINDPRINT_RENDER_RENDERS_MAX_MB = toString keep.maxSizeMb;
+    MINDPRINT_RENDER_RENDERS_GROUP = keep.group;
   } // cfg.extraEnvironment;
+  keep = cfg.keepRenders;
+  keepOutside = keep.enable && !(lib.hasPrefix (home + "/") keep.directory);
   nvidiaBin = lib.optional (config.hardware.nvidia.package or null != null) config.hardware.nvidia.package.bin;
   path = [ python pkgs.uv pkgs.coreutils pkgs.bash pkgs.gnutar pkgs.gzip pkgs.procps pkgs.systemd ]
     ++ nvidiaBin ++ cfg.extraPackages;
@@ -74,7 +84,7 @@ let
     RestrictNamespaces = true;
     LockPersonality = true;
     SystemCallArchitectures = "native";
-    ReadWritePaths = [ home ];
+    ReadWritePaths = [ home ] ++ lib.optional keepOutside keep.directory;
     DeviceAllow = deviceAllow;
   };
   sandboxArgs = lib.concatStringsSep " " (
@@ -145,9 +155,47 @@ in
       default = { };
       description = "Extra environment for both services (HTTPS_PROXY, HF_HUB_ENABLE_HF_TRANSFER, …).";
     };
+
+    keepRenders = {
+      enable = lib.mkEnableOption "keeping a local copy of every image this node renders, for the machine's owner to browse";
+
+      directory = lib.mkOption {
+        type = lib.types.str;
+        default = "${cfg.stateDir}/renders";
+        defaultText = lib.literalExpression ''"''${stateDir}/renders"'';
+        description = ''
+          Where the copies go: `<directory>/<YYYY-MM-DD>/<prediction>.png`, one file per render, 0640,
+          in a setgid `2750` tree owned by `mindprint-render:<group>`. A path outside `stateDir` is
+          added to the services' writable paths.
+        '';
+      };
+
+      maxSizeMb = lib.mkOption {
+        type = lib.types.int;
+        default = 10240;
+        description = "The tree's size cap in MB; past it the oldest days go first. 0 = no cap.";
+      };
+
+      group = lib.mkOption {
+        type = lib.types.str;
+        default = "mindprint-render";
+        description = ''
+          The group that can browse the tree. With the default, add your user to `mindprint-render`
+          (`users.users.<you>.extraGroups = [ "mindprint-render" ]`). Any other group needs a
+          `directory` outside `stateDir`, whose root only the service group may enter.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !keep.enable || keep.group == "mindprint-render" || keepOutside;
+        message = "services.mindprint-render.keepRenders: a group other than mindprint-render can only browse a directory outside stateDir (${home} is 0750 to the service group); set keepRenders.directory to a path elsewhere, e.g. /srv/mindprint-renders.";
+      }
+    ];
+
     warnings = lib.optional (!(config.hardware.graphics.enable or false) && nvidiaBin == [ ])
       "services.mindprint-render: no NVIDIA driver appears to be configured (hardware.nvidia / hardware.graphics); the node will start but its self-test will fail until one is.";
 
@@ -176,7 +224,7 @@ in
       "d ${home}/models 0750 mindprint-render mindprint-render -"
       "d ${home}/cache 0750 mindprint-render mindprint-render -"
       "d ${home}/venvs 0750 mindprint-render mindprint-render -"
-    ];
+    ] ++ lib.optional keep.enable "d ${keep.directory} 2750 mindprint-render ${keep.group} -";
 
     # The hand tool, for whoever is at the keyboard: status, pause, resume, selftest, bench.
     environment.systemPackages = [

@@ -44,7 +44,7 @@ The rest of this file is the detail behind those four steps.
   (PyTorch's CUDA builds), which are manylinux binaries; nix-ld is how they run on NixOS. If you
   already manage nix-ld, the lists merge. This is the module's only system-wide effect.
 - Puts one command on the PATH: `mindprint-render-node` (`status`, `pause`, `resume`,
-  `selftest`).
+  `selftest`, `pnginfo`).
 
 It does **not** open a port, change the firewall, touch Tailscale or any network setting, add a
 sudo rule, install Docker, or run anything as root after the rebuild. Its only listening socket
@@ -104,6 +104,10 @@ Options with their defaults, all optional:
 | `extraLibraries` | `[]` | more libraries for nix-ld, if a wheel wants one we did not list |
 | `extraPackages` | `[]` | more on the services' PATH |
 | `extraEnvironment` | `{}` | e.g. `HTTPS_PROXY` |
+| `keepRenders.enable` | `false` | keep a local copy of every image this node renders (see *Browsing what it rendered*) |
+| `keepRenders.directory` | `<stateDir>/renders` | where the copies go |
+| `keepRenders.maxSizeMb` | `10240` | the tree's cap; past it the oldest days go first (0 = no cap) |
+| `keepRenders.group` | `mindprint-render` | the group that can browse the tree |
 
 If you would rather not depend on a GitHub flake input, the module is two files
 (`mindprint-render.nix`, `updater.py`); vendoring them works the same, and they change rarely —
@@ -145,6 +149,9 @@ no network, or the very first install failing before anything has run.
 
 The module rarely changes, and when it does you will hear from us. Changes so far:
 
+- **2026-09-18** — `keepRenders` (`enable`, `directory`, `maxSizeMb`, `group`): a local copy of
+  every render, with its generation written into the PNG. Off unless you turn it on. Until the
+  input is bumped the page reads "not offered by this machine's module".
 - **2026-09-16** — `LD_LIBRARY_PATH` now carries the nix-ld library list beside the driver path
   (torch's `dlopen` from the Nix python never consults `NIX_LD_LIBRARY_PATH`; the first install on
   pheonix failed its self-test on `libstdc++.so.6` for exactly this). The `extraEnvironment`
@@ -171,6 +178,8 @@ retry-update` forgets the refusals so the next run (within five minutes) tries a
 - **Stop it:** `systemctl stop mindprint-render-node` — the card is free within one render
   (seconds for most models, under a minute for Z-Image). `start` brings it back.
 - **Pause across reboots:** `mindprint-render-node pause` / `resume`.
+- **Keep what it renders:** `keepRenders.enable = true` (above); `mindprint-render-node pnginfo
+  <file.png>` shows a kept file's prompts and parameters.
 - **Suspend / sleep:** fine. A render interrupted by sleep is re-done elsewhere; the node
   reconnects on wake.
 - **Updates:** automatic, from Mindprint, verified by checksum, with a self-test before and a
@@ -178,6 +187,40 @@ retry-update` forgets the refusals so the next run (within five minutes) tries a
   after the rebuild. We will tell you if this module itself ever needs a newer commit.
 - **Remove it:** `services.mindprint-render.enable = false;`, rebuild, `rm -rf
   /var/lib/mindprint-render`. The credential can be revoked from our side at any time.
+
+## Browsing what it rendered
+
+Off by default. Turn it on in the machine's configuration and rebuild; the Render nodes page
+shows whether each machine has it on and prints this block with that machine's current values,
+so a paste changes only the one thing:
+
+```nix
+services.mindprint-render.keepRenders = {
+  enable = true;
+  directory = "/var/lib/mindprint-render/renders";   # default
+  maxSizeMb = 10240;                                  # default; oldest days removed past it
+  group = "mindprint-render";                         # default; add yourself to browse:
+};
+users.users.<you>.extraGroups = [ "mindprint-render" ];
+```
+
+Every render then also lands at `<directory>/<YYYY-MM-DD>/<prediction>.png` (the machine's local
+day), 0640 in a setgid `2750` tree, so members of the group can read them and nobody else can. To
+browse as a group you already belong to, point `directory` outside the state directory (whose root
+only the service group may enter) — `directory = "/srv/mindprint-renders"; group = "users";` — and
+the module makes that path writable for the service. Nothing else changes: the upload to Mindprint
+is the same bytes, the copy is written before it, and a copy that cannot be written is reported on
+our page and never fails the render.
+
+**Each file carries its own recipe.** The PNG holds a `parameters` text chunk in the format
+AUTOMATIC1111 writes — the prompt the model actually received, the negative prompt, `Steps`,
+`Sampler`, `CFG scale`, `Seed`, `Size`, `Model`, `Tiling` — so A1111 / Forge / SD.Next read it in
+their PNG Info tab, ComfyUI builds a graph from it on drag-and-drop, and `exiftool`, sd-prompt-reader
+and the like print it. Beside the standard fields are ours: the person's original words (`User
+prompt`), the rewrite they became, the Mindprint prediction / attempt / request ids, the node's
+name, the weights' Hugging Face repo and commit. A second `Mindprint` chunk holds the whole
+record as JSON, including the exact input object the model was called with. On the machine,
+`mindprint-render-node pnginfo <file.png>` prints both.
 
 ## Which machine holds which model
 
@@ -191,3 +234,9 @@ Decided from our side, per machine, from the card and the host it reports:
   weights in system RAM and needs **~24 GB of free RAM**. A host with less (pheonix: 32 GB
   installed, ~23 GB idle) refuses the lane with a sentence on our page rather than swapping the
   desktop; it is a lane for the boxes with more RAM. Nothing to configure on the machine.
+- **Triton kernels are off on NixOS** unless you want them. torch routes a few eager CUDA ops to
+  Triton kernels it compiles on first use, and Triton needs `/sbin/ldconfig` (absent on NixOS —
+  the node points it at the driver's `libcuda` instead) and a C compiler on the service's path
+  (also absent). Without both the runtime says so once in its log and keeps torch's own CUDA
+  kernels; nothing is lost but a marginal speed-up. To turn them on, add `pkgs.gcc` to
+  `extraPackages`.
